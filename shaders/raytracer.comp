@@ -1,0 +1,171 @@
+#version 430 core
+
+// breaks the 1024x768 screen into 16x16 tiles run in parallel on the GPU
+layout(local_size_x = 32, local_size_y = 32) in;
+layout(rgba32f, binding = 0) writeonly uniform image2D img_output;
+
+uniform vec3 cam_pos;
+uniform vec3 cam_dir;
+uniform vec3 cam_right;
+uniform vec3 cam_up;
+
+// Ray r(t) = origin + t * dir
+struct Ray {
+    vec3 origin;
+    vec3 dir;
+};
+
+struct Hit {
+    float t;
+    vec3 pos;
+    vec3 normal;
+    vec3 color;
+    bool hit;
+};
+
+Hit hit_box(vec3 p_min, vec3 p_max, vec3 color, Ray r) {
+    vec3 t0 = (p_min - r.origin) / r.dir;
+    vec3 t1 = (p_max - r.origin) / r.dir;
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+    float near = max(max(tmin.x, tmin.y), tmin.z);
+    float far = min(min(tmax.x, tmax.y), tmax.z);
+
+    Hit h;
+    h.hit = false;
+
+    if (near > far || far < 0.0) return h;
+
+    h.t = near;
+    h.hit = true;
+    h.pos = r.origin + near * r.dir;
+    h.color = color;
+    vec3 n = -sign(r.dir) * step(tmin.yzx, tmin.xyz) * step(tmin.zxy, tmin.xyz);
+    h.normal = n;
+
+    return h;
+}
+
+Hit hit_sphere(vec3 center, float radius, vec3 color, Ray r) {
+    vec3 oc = r.origin - center;
+    float b = dot(oc, r.dir);
+    float c = dot(oc, oc) - radius * radius;
+    float h = b * b - c;
+
+    Hit res; res.hit = false;
+    if (h < 0.0) return res;
+
+    float t = -b - sqrt(h);
+    if (t < 0.0) return res;
+
+    res.t = t;
+    res.hit = true;
+    res.pos = r.origin + t * r.dir;
+    res.normal = normalize(res.pos - center);
+    res.color = color;
+
+    return res;
+}
+
+Hit get_scene_hit(Ray r) {
+    Hit closest;
+    closest.t = 1e30;
+    closest.hit = false;
+    Hit h;
+    h = hit_sphere(vec3(0, -0.5, 0), 0.5, vec3(1.0), r);
+
+    // was sphere hit?
+    if (h.hit && h.t < closest.t) closest = h;
+
+
+    h = hit_sphere(vec3(-0.5, 1.0, 0), 0.5, vec3(0.0, 1.0, 1.0), r);
+
+    // was sphere hit?
+    if (h.hit && h.t < closest.t) closest = h;
+
+    float s = 2.0;
+
+    // back plane hit (blue)
+    if ((h = hit_box(vec3(-s, -s, -s), vec3(s, s, -s+0.1), vec3(0.1, 0.1, 1), r)).hit && h.t < closest.t) closest = h;
+
+    // left plane hit (red)
+    if ((h = hit_box(vec3(-s - 0.1, -s, -s), vec3(-s, s, s), vec3(1, 0.1, 0.1), r)).hit && h.t < closest.t) closest = h;
+
+    // right plane hit (green)
+    if ((h = hit_box(vec3(s, -s, -s), vec3(s + 0.1, s, s), vec3(0.1, 1, 0.1), r)).hit && h.t < closest.t) closest = h;
+
+    // top plane hit (gray)
+    if ((h = hit_box(vec3(-s, s, -s), vec3(s, s + 0.1, s), vec3(0.7), r)).hit && h.t < closest.t) closest = h;
+
+    // bottom plane hit (gray)
+    if ((h = hit_box(vec3(-s, -s - 0.1, -s), vec3(s, -s, s), vec3(0.7), r)).hit && h.t < closest.t) closest = h;
+
+    return closest;
+}
+
+// remember: this shader is executed for each pixel
+// STEPS:
+// 1. generate ray by converting pixels (x,y) coordinates into 3d direction based on the camera transformation (rotation, etc)
+// 2. run raytracing lloop:
+//   a) Find closest hit
+//   b) calculate light contribution (using blinn model) and check of shadows at the spot
+//   c) add that color to the poxel's total accumulation
+//   d) reflect the ray and repeat
+// 3. Store the final color into the texture
+void main() {
+    // tell the the shader exactly which pixel (x,y) it is currently responsible for
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(img_output);
+
+    // ensure that we do not calulate pixels outside the current 16x16 blocks
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    // normalize to uv space (from pixelcoordinates [width, height] to [-1, 1] ranges)
+    vec2 uv = (vec2(px) / vec2(size)) * 2.0 - 1.0;
+
+    // prevent warping: ensure that unit of distance in the shader covers
+    // the same distance on the monitor resolution (i.e., both, long horizontal and vertical directions)
+    float aspect = float(size.x) / float(size.y);
+    uv.x *= aspect;
+
+    Ray ray;
+    ray.origin = cam_pos;
+
+    // uv.x * cam_right is the offsets the ray to the left or right of center and
+    // uv.y * cam_up is the offsets the ray up or down from center
+    ray.dir = normalize(cam_dir + uv.x * cam_right + uv.y * cam_up);
+
+    vec3 light_pos = vec3(0, 1.9, 0);
+    vec3 final_accum = vec3(0.0);
+
+    // simulates the surface abosrbing some light: without this factor, a ray would bounce forever
+    vec3 throughput = vec3(1.0);
+
+    // multipole bounces
+    for (int i = 0; i < 20; i++) {
+        Hit hit = get_scene_hit(ray);
+        if (!hit.hit) {
+            final_accum += vec3(0.02) * throughput;
+            break;
+        }
+
+        // calculate the angle between the surface normal and the light source. If the surface faces the light, it is bright (closer to 1), otherwise is is dark (closer to zero)
+        vec3 L = normalize(light_pos - hit.pos);
+        float diff = max(dot(hit.normal, L), 0.0);
+
+        // from the hit point, fire a new ray directly towards the light source. if the ray hits any primitive before reaching the light source, we know that the light is blocked.
+        Ray shadow_ray = Ray(hit.pos + hit.normal * 0.001, L);
+        Hit shadow_hit = get_scene_hit(shadow_ray);
+
+        // shadow brightness is multipled by a small factor to produce dark shades
+        float shadow = (shadow_hit.hit && shadow_hit.t < length(light_pos - hit.pos)) ? 0.01 : 1.0;
+
+        final_accum += hit.color * (diff * shadow + 0.05) * throughput;
+
+        // after a hit, the throughput weakens because of absopritons of the spectrum
+        throughput *= 0.3 * hit.color;
+        ray.origin = hit.pos + hit.normal * 0.001;
+        ray.dir = reflect(ray.dir, hit.normal);
+    }
+    imageStore(img_output, px, vec4(final_accum, 1.0));
+}
